@@ -1,0 +1,787 @@
+diff --git a/Vimo-desktop/python_backend/videorag/_llm.py b/Vimo-desktop/python_backend/videorag/_llm.py
+index 54973ee..0680bf7 100755
+--- a/Vimo-desktop/python_backend/videorag/_llm.py
++++ b/Vimo-desktop/python_backend/videorag/_llm.py
+@@ -1,6 +1,9 @@
+ # type: ignore
+ import numpy as np
+ from openai import AsyncOpenAI, AsyncAzureOpenAI, APIConnectionError, RateLimitError
++import httpx
++import numpy as np
++import numpy as np
+ from dataclasses import asdict, dataclass, field
+ 
+ from tenacity import (
+@@ -181,6 +184,135 @@ async def dashscope_caption_complete(
+     
+     return response.choices[0].message.content
+ 
++async def ollama_caption_complete(
++    model_name: str,
++    content_list,
++    **kwargs,
++) -> str:
++    """
++    Call Ollama vision model (e.g., llava:13b) to caption frames.
++    Expects content_list with entries like {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
++    and {"type": "text", "text": "prompt"} similar to the dashscope format used elsewhere.
++    """
++    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
++    
++    # Strip "ollama:" prefix if present
++    if model_name.startswith("ollama:"):
++        model_name = model_name[7:]  # Remove "ollama:" prefix
++
++    images = []
++    prompts = []
++    for item in content_list:
++        if item.get("type") == "text":
++            if item.get("text"):
++                prompts.append(item.get("text"))
++        elif item.get("type") == "image_url":
++            url = item.get("image_url", {}).get("url", "")
++            # For Ollama, extract just the base64 part (no data URI prefix)
++            if "data:image/" in url and "base64," in url:
++                base64_data = url.split("base64,", 1)[1]
++                # Validate base64 data is not empty
++                if base64_data and len(base64_data) > 0:
++                    images.append(base64_data)
++            elif url:
++                images.append(url)
++
++    prompt = "\n".join(p for p in prompts if p.strip()) or "Describe the image."
++    
++    # If no images, return a generic caption
++    if not images:
++        return "A video frame from the content."
++
++    try:
++        async with httpx.AsyncClient(timeout=180) as client:
++            resp = await client.post(
++                f"{base_url.rstrip('/')}/api/generate",
++                json={
++                    "model": model_name,
++                    "prompt": prompt,
++                    "images": images,
++                    "stream": False,
++                },
++            )
++            resp.raise_for_status()
++            data = resp.json()
++            response_text = data.get("response", "")
++            
++            # If empty response, return fallback
++            if not response_text or not response_text.strip():
++                return "A video frame showing visual content."
++            
++            return response_text
++            
++    except httpx.HTTPStatusError as e:
++        # Log the error but return a fallback caption instead of failing
++        print(f"⚠️  Ollama caption HTTP error {e.response.status_code}, using fallback caption")
++        return "A scene from the video content."
++    except Exception as e:
++        print(f"⚠️  Ollama caption error: {str(e)}, using fallback caption")
++        return "A frame from the video."
++
++async def ollama_embedding(
++    texts: list[str],
++    model: str = "bge-m3:latest",
++    **kwargs,
++) -> np.ndarray:
++    """
++    Get embeddings from Ollama embedding model (e.g., bge-m3:latest).
++    """
++    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
++    
++    # Use model_name from kwargs if provided (passed by EmbeddingFunc wrapper)
++    model = kwargs.get("model_name", model)
++    
++    # Strip "ollama:" prefix if present  
++    if model.startswith("ollama:"):
++        model = model[7:]  # Remove "ollama:" prefix
++    
++    async with httpx.AsyncClient(timeout=120) as client:
++        embeddings = []
++        for text in texts:
++            resp = await client.post(
++                f"{base_url.rstrip('/')}/api/embeddings",
++                json={
++                    "model": model,
++                    "prompt": text,
++                },
++            )
++            resp.raise_for_status()
++            result = resp.json()
++            embeddings.append(result.get("embedding", []))
++    
++    return np.array(embeddings)
++
++async def ollama_text_complete(
++    model_name: str,
++    prompt: str,
++    **kwargs,
++) -> str:
++    """
++    Complete text using Ollama models (e.g., qwen2.5:72b, mixtral:8x22b).
++    """
++    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
++    
++    # Strip "ollama:" prefix if present
++    if model_name.startswith("ollama:"):
++        model_name = model_name[7:]  # Remove "ollama:" prefix
++    
++    async with httpx.AsyncClient(timeout=300) as client:  # 5min timeout for large models
++        resp = await client.post(
++            f"{base_url.rstrip('/')}/api/generate",
++            json={
++                "model": model_name,
++                "prompt": prompt,
++                "stream": False,
++            },
++        )
++        resp.raise_for_status()
++        response = resp.json()
++    
++    return response.get("response", "")
++
+ openai_4o_mini_config = LLMConfig(
+     embedding_func_raw = openai_embedding,
+     embedding_model_name = "text-embedding-3-small",
+diff --git a/Vimo-desktop/python_backend/videorag/_op.py b/Vimo-desktop/python_backend/videorag/_op.py
+index 55b5ea3..cc9b5f1 100755
+--- a/Vimo-desktop/python_backend/videorag/_op.py
++++ b/Vimo-desktop/python_backend/videorag/_op.py
+@@ -465,7 +465,7 @@ async def extract_entities(
+     )
+     if not len(all_entities_data):
+         logger.warning("Didn't extract any entities, maybe your LLM is not working")
+-        return None
++        return None, None, None
+     if entity_vdb is not None:
+         data_for_vdb = {
+             compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+diff --git a/Vimo-desktop/python_backend/videorag/_videoutil/asr.py b/Vimo-desktop/python_backend/videorag/_videoutil/asr.py
+index b2de87e..e5c1eb6 100755
+--- a/Vimo-desktop/python_backend/videorag/_videoutil/asr.py
++++ b/Vimo-desktop/python_backend/videorag/_videoutil/asr.py
+@@ -5,6 +5,27 @@ import dashscope
+ from dashscope.audio.asr import Recognition
+ from .._utils import logger
+ 
++# Add Whisper for local ASR
++import whisper
++import torch
++
++def get_whisper_model(model_size="base"):
++    """Get or load Whisper model"""
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    logger.info(f"Loading Whisper model '{model_size}' on {device}")
++    return whisper.load_model(model_size, device=device)
++
++async def whisper_transcribe_segment(model, audio_file_path):
++    """Transcribe audio file using local Whisper model"""
++    try:
++        # Run Whisper transcription in thread pool to avoid blocking
++        loop = asyncio.get_event_loop()
++        result = await loop.run_in_executor(None, model.transcribe, audio_file_path)
++        return result.get("text", "").strip()
++    except Exception as e:
++        logger.error(f"Whisper transcription failed for {audio_file_path}: {str(e)}")
++        return ""
++
+ async def process_single_segment(semaphore, index, segment_name, audio_file, model, audio_output_format, sample_rate):
+     """
+     Process a single audio segment with ASR
+@@ -99,10 +120,56 @@ async def speech_to_text_online(video_name, working_dir, segment_index2name, aud
+     
+     return transcripts
+ 
++async def speech_to_text_local_whisper(video_name, working_dir, segment_index2name, audio_output_format, global_config):
++    """Local ASR using Whisper model"""
++    logger.info(f"🎤 Starting LOCAL Whisper ASR for video: {video_name}")
++    
++    # Get Whisper model size from config (default: base)
++    whisper_model_size = global_config.get("whisper_model_size", "base")  # tiny, base, small, medium, large
++    whisper_model = get_whisper_model(whisper_model_size)
++    
++    audio_dir = os.path.join(working_dir, "temp_audio")
++    transcripts = {}
++    
++    # Create semaphore to limit concurrent processing (Whisper can be memory intensive)
++    max_concurrent = min(2, len(segment_index2name))  # Limit to 2 concurrent for memory
++    semaphore = asyncio.Semaphore(max_concurrent)
++    
++    async def process_whisper_segment(index, segment_name):
++        async with semaphore:
++            audio_file_path = os.path.join(audio_dir, f"{segment_name}.{audio_output_format}")
++            if not os.path.exists(audio_file_path):
++                logger.warning(f"Audio file not found: {audio_file_path}")
++                return index, ""
++            
++            transcript = await whisper_transcribe_segment(whisper_model, audio_file_path)
++            logger.info(f"✅ Whisper transcribed {segment_name}: {transcript[:50]}...")
++            return index, transcript
++    
++    # Process all segments
++    tasks = [process_whisper_segment(index, name) for index, name in segment_index2name.items()]
++    
++    completed = 0
++    total_tasks = len(tasks)
++    logger.info(f"🚀 Processing {total_tasks} audio segments with Whisper...")
++    
++    for completed_task in asyncio.as_completed(tasks):
++        try:
++            index, text = await completed_task
++            transcripts[index] = text
++            completed += 1
++            logger.info(f"✅ Whisper completed {completed}/{total_tasks} segments ({completed/total_tasks*100:.1f}%)")
++        except Exception as e:
++            completed += 1
++            logger.error(f"❌ Whisper task failed: {e}")
++    
++    logger.info(f"🎉 LOCAL Whisper ASR completed! Processed {len(transcripts)} segments.")
++    return transcripts
++
+ 
+ async def speech_to_text_async(video_name, working_dir, segment_index2name, audio_output_format, global_config):
+     """
+-    Async speech-to-text function using Alibaba Cloud DashScope online ASR
++    Async speech-to-text function with support for both local Whisper and online DashScope ASR
+     
+     Args:
+         video_name: Name of the video
+@@ -111,14 +178,24 @@ async def speech_to_text_async(video_name, working_dir, segment_index2name, audi
+         audio_output_format: Audio file format
+         global_config: Global configuration dictionary containing API keys and settings
+     """
++    # Check if we should use local Whisper or online DashScope
++    use_local_asr = global_config.get("use_local_asr", True)  # Default to local
+     api_key = global_config.get('ali_dashscope_api_key')
+     
+-    if not api_key:
+-        raise ValueError("ali_dashscope_api_key must be provided in global_config for online ASR")
+-    
+-    return await speech_to_text_online(
+-        video_name, working_dir, segment_index2name, audio_output_format, global_config
+-    )
++    if use_local_asr or not api_key:
++        if not api_key:
++            logger.info("🎤 No DashScope API key found - using LOCAL Whisper ASR")
++        else:
++            logger.info("🎤 Local ASR enabled - using Whisper instead of DashScope")
++        
++        return await speech_to_text_local_whisper(
++            video_name, working_dir, segment_index2name, audio_output_format, global_config
++        )
++    else:
++        logger.info("🎤 Using online DashScope ASR")
++        return await speech_to_text_online(
++            video_name, working_dir, segment_index2name, audio_output_format, global_config
++        )
+ 
+ def speech_to_text(video_name, working_dir, segment_index2name, audio_output_format, global_config):
+     """
+diff --git a/Vimo-desktop/python_backend/videorag/_videoutil/feature.py b/Vimo-desktop/python_backend/videorag/_videoutil/feature.py
+index ad259d4..97e4e94 100755
+--- a/Vimo-desktop/python_backend/videorag/_videoutil/feature.py
++++ b/Vimo-desktop/python_backend/videorag/_videoutil/feature.py
+@@ -1,30 +1,112 @@
+ import os
++import sys
++import json
++import subprocess
+ import torch
+ import pickle
+-from tqdm import tqdm
++import base64
++import numpy as np
+ from imagebind import data
+ from imagebind.models import imagebind_model
+ from imagebind.models.imagebind_model import ImageBindModel, ModalityType
+ 
++# Path to the subprocess encoder script (same directory as this file)
++_SUBPROCESS_ENCODER = os.path.join(os.path.dirname(__file__), "subprocess_video_encoder.py")
+ 
+-def encode_video_segments(video_paths, embedder: ImageBindModel):
+-    device = next(embedder.parameters()).device
+-    inputs = {
+-        ModalityType.VISION: data.load_and_transform_video_data(video_paths, device),
+-    }
+-    with torch.no_grad():
+-        embeddings = embedder(inputs)[ModalityType.VISION]
+-    if isinstance(embeddings, torch.Tensor):
+-        embeddings = embeddings.cpu()
+-    return embeddings
+ 
+-def encode_string_query(query:str, embedder: ImageBindModel):
++def encode_video_segments(video_paths, embedder: ImageBindModel, model_path: str = None):
++    """
++    Encode video segments using subprocess isolation.
++    
++    Each batch of videos is encoded in a FRESH Python subprocess to prevent
++    the pytorchvideo/decord NDArray state pollution bug where subsequent
++    encoding calls fail with "'NDArray' object has no attribute 'to'".
++    
++    Args:
++        video_paths: List of video file paths to encode
++        embedder: ImageBindModel instance (used to determine device; model is 
++                  re-loaded in the subprocess for clean state)
++        model_path: Path to imagebind_huge.pth weights file. If None, attempts
++                    to find it from environment or standard locations.
++    """
++    device = str(next(embedder.parameters()).device)
++    
++    # Resolve model path
++    if model_path is None:
++        model_path = os.environ.get("IMAGEBIND_MODEL_PATH", "")
++    
++    if not model_path or not os.path.exists(model_path):
++        raise FileNotFoundError(
++            f"ImageBind model path not found: {model_path}. "
++            "Set IMAGEBIND_MODEL_PATH environment variable or pass model_path."
++        )
++    
++    # Determine the Python executable (use the same Python running this process)
++    python_exe = sys.executable
++    
++    # Build the request payload
++    request_payload = json.dumps({
++        "model_path": model_path,
++        "device": device,
++        "video_paths": list(video_paths),
++    })
++    
++    print(f"[subprocess_encode] Encoding {len(video_paths)} videos via subprocess (device={device})")
++    
++    # Run encoding in a fresh subprocess
++    proc = subprocess.run(
++        [python_exe, _SUBPROCESS_ENCODER],
++        input=request_payload,
++        capture_output=True,
++        text=True,
++        timeout=1800,  # 30 min timeout
++    )
++    
++    # Parse the last non-empty line of stdout as JSON (skip any warnings that leak)
++    stdout_lines = [l for l in proc.stdout.strip().split("\n") if l.strip()]
++    if not stdout_lines:
++        stderr_msg = proc.stderr[-2000:] if proc.stderr else "No output"
++        raise RuntimeError(
++            f"Subprocess encoder produced no output. "
++            f"Exit code: {proc.returncode}. Stderr: {stderr_msg}"
++        )
++    
++    # The JSON result is the last line
++    result_line = stdout_lines[-1]
++    try:
++        result = json.loads(result_line)
++    except json.JSONDecodeError:
++        raise RuntimeError(
++            f"Failed to parse subprocess output as JSON: {result_line[:500]}"
++        )
++    
++    if not result.get("success"):
++        raise RuntimeError(f"Subprocess encoding failed: {result.get('error', 'unknown')}")
++    
++    # Deserialize embeddings
++    embeddings_bytes = base64.b64decode(result["embeddings_b64"])
++    embeddings_np = pickle.loads(embeddings_bytes)
++    embeddings_tensor = torch.from_numpy(embeddings_np)
++    
++    print(f"[subprocess_encode] Success: shape={result['shape']}")
++    return embeddings_tensor
++
++
++def encode_string_query(query: str, embedder: ImageBindModel):
++    """
++    Encode text query (runs in-process - no NDArray bug for text).
++    """
+     device = next(embedder.parameters()).device
++    
++    text_data = data.load_and_transform_text([query], device)
++    
+     inputs = {
+-        ModalityType.TEXT: data.load_and_transform_text([query], device),
++        ModalityType.TEXT: text_data,
+     }
+     with torch.no_grad():
+         embeddings = embedder(inputs)[ModalityType.TEXT]
++    
+     if isinstance(embeddings, torch.Tensor):
+         embeddings = embeddings.cpu()
+-    return embeddings
+\ No newline at end of file
++    
++    return embeddings
+diff --git a/Vimo-desktop/python_backend/videorag/videorag.py b/Vimo-desktop/python_backend/videorag/videorag.py
+index e36eb81..1c322d7 100755
+--- a/Vimo-desktop/python_backend/videorag/videorag.py
++++ b/Vimo-desktop/python_backend/videorag/videorag.py
+@@ -132,12 +132,26 @@ class VideoRAG:
+         # Configure logger to write to file
+         log_file = os.path.join(self.working_dir, "log.txt")
+         
+-        assert self.ali_dashscope_api_key is not None, "ali_dashscope_api_key is required"
+-        assert self.ali_dashscope_base_url is not None, "ali_dashscope_base_url is required"
++        # Smart validation - only require external API keys if not using local models
++        
++        # Check if using local Ollama models
++        using_local_caption = self.caption_model and (self.caption_model.startswith("ollama:") or "llava" in self.caption_model.lower())
++        using_local_llm = hasattr(self.llm, 'best_model_name') and self.llm.best_model_name and (self.llm.best_model_name.startswith("ollama:") or any(x in self.llm.best_model_name.lower() for x in ["qwen", "mixtral", "gemma", "llama"]))
++        using_local_embedding = hasattr(self.llm, 'embedding_model_name') and self.llm.embedding_model_name and (self.llm.embedding_model_name.startswith("ollama:") or "bge" in self.llm.embedding_model_name.lower())
++        
++        # Only require DashScope API key if using DashScope models
++        if not using_local_caption:
++            assert self.ali_dashscope_api_key is not None, "ali_dashscope_api_key is required for DashScope models"
++            assert self.ali_dashscope_base_url is not None, "ali_dashscope_base_url is required for DashScope models"
++            
++        # Only require OpenAI API key if using OpenAI models
++        if not (using_local_llm and using_local_embedding):
++            assert self.openai_api_key is not None, "openai_api_key is required for OpenAI models"
++            assert self.openai_base_url is not None, "openai_base_url is required for OpenAI models"
++        
++        # Always require these
+         assert self.caption_model is not None, "caption_model is required"
+         assert self.asr_model is not None, "asr_model is required"
+-        assert self.openai_api_key is not None, "openai_api_key is required"
+-        assert self.openai_base_url is not None, "openai_base_url is required"
+ 
+         # Create working directory if it doesn't exist
+         if not os.path.exists(self.working_dir) and self.always_create_working_dir:
+diff --git a/Vimo-desktop/python_backend/videorag_api.py b/Vimo-desktop/python_backend/videorag_api.py
+index 3581025..8d5c8ea 100644
+--- a/Vimo-desktop/python_backend/videorag_api.py
++++ b/Vimo-desktop/python_backend/videorag_api.py
+@@ -3,6 +3,11 @@ import os
+ import certifi
+ os.environ['SSL_CERT_FILE'] = certifi.where()
+ os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
++
++# ============= IMAGEBIND NDARRAY FIX =============
++# Startup message only - actual fix is in imagebind/data.py with _ensure_tensor function
++print("✅ ImageBind NDArray fix loaded (patched data.py)")
++# ============= END IMAGEBIND NDARRAY FIX =============
+ import time
+ import threading
+ import multiprocessing
+@@ -26,7 +31,7 @@ import warnings
+ warnings.filterwarnings("ignore")
+ logging.getLogger("httpx").setLevel(logging.WARNING)
+ 
+-from videorag._llm import LLMConfig, openai_embedding, gpt_complete, dashscope_caption_complete
++from videorag._llm import LLMConfig, openai_embedding, gpt_complete, dashscope_caption_complete, ollama_caption_complete, ollama_embedding, ollama_text_complete
+ from videorag import VideoRAG, QueryParam
+ 
+ # Log recording function
+@@ -95,6 +100,28 @@ def update_session_status(chat_id: str, base_storage_path: str, status_type: str
+     write_status_json(status_file, current_status)
+     log_to_file(f"📝 Updated {status_type} status for {chat_id}")
+ 
++
++def select_caption_func(global_config):
++    """Choose caption backend based on configured model name."""
++    name = (global_config.get("caption_model") or "").lower()
++    if name.startswith("ollama:") or name.startswith("llava"):
++        return ollama_caption_complete
++    return dashscope_caption_complete
++
++def select_embedding_func(global_config):
++    """Choose embedding backend based on configured model name."""
++    name = (global_config.get("embedding_model") or "").lower()
++    if name.startswith("ollama:") or "bge" in name:
++        return ollama_embedding
++    return openai_embedding
++
++def select_text_func(global_config):
++    """Choose text completion backend based on configured model name."""
++    name = (global_config.get("text_model") or "").lower()
++    if name.startswith("ollama:") or any(x in name for x in ["qwen", "mixtral", "gemma", "llama"]):
++        return ollama_text_complete
++    return gpt_complete
++
+ class GlobalImageBindManager:
+     """Global ImageBind manager, providing HTTP API interface, supporting concurrent access control"""
+     
+@@ -118,6 +145,8 @@ class GlobalImageBindManager:
+                 "configured_at": time.time()
+             }
+             self.is_initialized = True
++            # Set env var so subprocess encoder can find the model
++            os.environ["IMAGEBIND_MODEL_PATH"] = model_path
+             log_to_file(f"✅ ImageBind manager configured with model path: {model_path}")
+             return True
+                 
+@@ -200,7 +229,7 @@ class GlobalImageBindManager:
+                 raise
+                 
+     def encode_video_segments(self, video_batch: List[str]) -> np.ndarray:
+-        """Encode video segments"""
++        """Encode video segments via subprocess isolation"""
+         with self._lock:
+             if not self.is_loaded:
+                 raise RuntimeError("ImageBind not loaded")
+@@ -208,8 +237,8 @@ class GlobalImageBindManager:
+             self.usage_count += 1
+             
+             from videorag._videoutil import encode_video_segments
+-            result = encode_video_segments(video_batch, self.embedder)
+-            log_to_file(f"🎬 Encoded {len(video_batch)} video segments")
++            result = encode_video_segments(video_batch, self.embedder, model_path=self.model_path)
++            log_to_file(f"🎬 Encoded {len(video_batch)} video segments (subprocess)")
+             return result
+                 
+     def encode_string_query(self, query: str) -> np.ndarray:
+@@ -643,24 +672,50 @@ def index_video_worker_process(chat_id, video_path_list, global_config, server_u
+         session_working_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
+         os.makedirs(session_working_dir, exist_ok=True)
+         
++        # Normalize config keys from camelCase to snake_case
++        if "asr_model" not in global_config:
++            global_config["asr_model"] = global_config.get("asrModel", "local")
++        if "embedding_model" not in global_config:
++            global_config["embedding_model"] = "ollama:mxbai-embed-large:latest"
++        if "caption_model" not in global_config:
++            global_config["caption_model"] = global_config.get("captionModel", "ollama:llava:13b")
++        if "openai_api_key" not in global_config:
++            global_config["openai_api_key"] = global_config.get("openaiApiKey", "ollama-local")
++        if "openai_base_url" not in global_config:
++            global_config["openai_base_url"] = global_config.get("openaiBaseUrl", "http://localhost:11434/v1")
++        
++        caption_model = global_config.get("caption_model", "ollama:llava:13b")
++        embedding_model = global_config.get("embedding_model", "ollama:mxbai-embed-large:latest") 
++        analysis_model = global_config.get("analysisModel", "ollama:qwen2.5:72b")
++        processing_model = global_config.get("processingModel", "ollama:qwen2.5:14b")
++        
++        config_for_caption = dict(global_config)
++        config_for_caption["caption_model"] = caption_model
++        config_for_embedding = dict(global_config)
++        config_for_embedding["embedding_model"] = embedding_model
++        config_for_analysis = dict(global_config) 
++        config_for_analysis["text_model"] = analysis_model
++        config_for_processing = dict(global_config)
++        config_for_processing["text_model"] = processing_model
++        
+         videorag_llm_config = LLMConfig(
+-            embedding_func_raw=openai_embedding,
+-            embedding_model_name="text-embedding-3-small",
+-            embedding_dim=1536,
+-            embedding_max_token_size=8192,
+-            embedding_batch_num=32,
+-            embedding_func_max_async=16,
++            embedding_func_raw=select_embedding_func(config_for_embedding),
++            embedding_model_name=embedding_model,
++            embedding_dim=global_config.get("embedding_dim", 1024 if ("bge" in embedding_model or "mxbai" in embedding_model) else 1536),
++            embedding_max_token_size=global_config.get("embedding_max_tokens", 8192),
++            embedding_batch_num=global_config.get("embedding_batch_num", 32),
++            embedding_func_max_async=global_config.get("embedding_func_max_async", 16),
+             query_better_than_threshold=0.2,
+-            best_model_func_raw=gpt_complete,
+-            best_model_name=global_config.get("analysisModel"),    
++            best_model_func_raw=select_text_func(config_for_analysis),
++            best_model_name=analysis_model,    
+             best_model_max_token_size=32768,
+             best_model_max_async=16,
+-            cheap_model_func_raw=gpt_complete,
+-            cheap_model_name=global_config.get("processingModel"),
++            cheap_model_func_raw=select_text_func(config_for_processing),
++            cheap_model_name=processing_model,
+             cheap_model_max_token_size=32768,
+             cheap_model_max_async=16,
+-            caption_model_func_raw=dashscope_caption_complete,
+-            caption_model_name=global_config.get("caption_model"),
++            caption_model_func_raw=select_caption_func(config_for_caption),
++            caption_model_name=caption_model,
+             caption_model_max_async=3
+         )
+         
+@@ -669,7 +724,7 @@ def index_video_worker_process(chat_id, video_path_list, global_config, server_u
+             working_dir=session_working_dir,
+             ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
+             ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
+-            caption_model=global_config.get("caption_model"),
++            caption_model=caption_model,
+             asr_model=global_config.get("asr_model"),
+             openai_api_key=global_config.get("openai_api_key"),
+             openai_base_url=global_config.get("openai_base_url"),
+@@ -764,24 +819,50 @@ def query_worker_process(chat_id, query, global_config, server_url):
+         session_working_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
+         assert os.path.exists(session_working_dir), f"Session working directory does not exist: {session_working_dir}"
+ 
++        # Normalize config keys from camelCase to snake_case
++        if "asr_model" not in global_config:
++            global_config["asr_model"] = global_config.get("asrModel", "local")
++        if "embedding_model" not in global_config:
++            global_config["embedding_model"] = "ollama:mxbai-embed-large:latest"
++        if "caption_model" not in global_config:
++            global_config["caption_model"] = global_config.get("captionModel", "ollama:llava:13b")
++        if "openai_api_key" not in global_config:
++            global_config["openai_api_key"] = global_config.get("openaiApiKey", "ollama-local")
++        if "openai_base_url" not in global_config:
++            global_config["openai_base_url"] = global_config.get("openaiBaseUrl", "http://localhost:11434/v1")
++        
++        caption_model = global_config.get("caption_model", "ollama:llava:13b")
++        embedding_model = global_config.get("embedding_model", "ollama:mxbai-embed-large:latest") 
++        analysis_model = global_config.get("analysisModel", "ollama:qwen2.5:72b")
++        processing_model = global_config.get("processingModel", "ollama:qwen2.5:14b")
++        
++        config_for_caption = dict(global_config)
++        config_for_caption["caption_model"] = caption_model
++        config_for_embedding = dict(global_config)
++        config_for_embedding["embedding_model"] = embedding_model
++        config_for_analysis = dict(global_config) 
++        config_for_analysis["text_model"] = analysis_model
++        config_for_processing = dict(global_config)
++        config_for_processing["text_model"] = processing_model
++        
+         videorag_llm_config = LLMConfig(
+-            embedding_func_raw=openai_embedding,
+-            embedding_model_name="text-embedding-3-small",
+-            embedding_dim=1536,
+-            embedding_max_token_size=8192,
+-            embedding_batch_num=32,
+-            embedding_func_max_async=16,
++            embedding_func_raw=select_embedding_func(config_for_embedding),
++            embedding_model_name=embedding_model,
++            embedding_dim=global_config.get("embedding_dim", 1024 if ("bge" in embedding_model or "mxbai" in embedding_model) else 1536),
++            embedding_max_token_size=global_config.get("embedding_max_tokens", 8192),
++            embedding_batch_num=global_config.get("embedding_batch_num", 32),
++            embedding_func_max_async=global_config.get("embedding_func_max_async", 16),
+             query_better_than_threshold=0.2,
+-            best_model_func_raw=gpt_complete,
+-            best_model_name=global_config.get("analysisModel"),    
++            best_model_func_raw=select_text_func(config_for_analysis),
++            best_model_name=analysis_model,    
+             best_model_max_token_size=32768,
+             best_model_max_async=16,
+-            cheap_model_func_raw=gpt_complete,
+-            cheap_model_name=global_config.get("processingModel"),
++            cheap_model_func_raw=select_text_func(config_for_processing),
++            cheap_model_name=processing_model,
+             cheap_model_max_token_size=32768,
+             cheap_model_max_async=16,
+-            caption_model_func_raw=dashscope_caption_complete,
+-            caption_model_name=global_config.get("caption_model"),
++            caption_model_func_raw=select_caption_func(config_for_caption),
++            caption_model_name=caption_model,
+             caption_model_max_async=3
+         )
+         
+@@ -790,7 +871,7 @@ def query_worker_process(chat_id, query, global_config, server_url):
+             working_dir=session_working_dir,
+             ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
+             ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
+-            caption_model=global_config.get("caption_model"),
++            caption_model=caption_model,
+             asr_model=global_config.get("asr_model"),
+             openai_api_key=global_config.get("openai_api_key"),
+             openai_base_url=global_config.get("openai_base_url"),
+@@ -821,16 +902,60 @@ def query_worker_process(chat_id, query, global_config, server_url):
+         log_to_file(f"✅ Query processing completed for chat {chat_id}")
+         
+     except Exception as e:
++        import traceback
++        error_msg = f"Query processing failed: {str(e)}"
++        tb_str = traceback.format_exc()
++        log_to_file(f"❌ {error_msg}\n{tb_str}")
+         base_storage_path = global_config.get("base_storage_path")
+         update_session_status(chat_id, base_storage_path, "query_status", {
+             "status": "error",
+-            "message": f"Query processing failed: {str(e)}",
++            "message": error_msg,
+             "current_step": "Error",
+-            "query": query
++            "query": query,
++            "error_details": tb_str[-500:] if len(tb_str) > 500 else tb_str
+         })
+-        log_to_file(f"❌ Query processing failed: {str(e)}")
+ 
+ # Flask application factory function
++def auto_initialize_from_bootstrap():
++    """Auto-initialize from bootstrap configuration file"""
++    try:
++        bootstrap_file = os.path.expanduser("~/.videorag-bootstrap.json")
++        if os.path.exists(bootstrap_file):
++            with open(bootstrap_file, 'r') as f:
++                bootstrap_config = json.load(f)
++            
++            store_dir = bootstrap_config.get("storeDirectory")
++            if store_dir and os.path.exists(store_dir):
++                config_file = os.path.join(store_dir, "config.json")
++                if os.path.exists(config_file):
++                    with open(config_file, 'r') as f:
++                        app_config = json.load(f)
++                    
++                    # Normalize config keys from camelCase to snake_case
++                    normalized_config = {
++                        "base_storage_path": store_dir,
++                        "image_bind_model_path": "/data1/home/kunalc/VideoRAG/VideoRAG-algorithm/.checkpoints/imagebind_huge.pth",
++                        "embedding_model": "ollama:mxbai-embed-large:latest",
++                        "text_model": app_config.get("analysisModel", "gemma2:27b"),
++                        "processing_model": app_config.get("processingModel", "gemma2:27b"),
++                        "caption_model": app_config.get("captionModel", "llava:13b"),
++                        "asr_model": app_config.get("asrModel", "local"),
++                        "openai_api_key": app_config.get("openaiApiKey", "ollama-local"),
++                        "openai_base_url": app_config.get("openaiBaseUrl", "http://localhost:11434/v1"),
++                        "ali_dashscope_api_key": app_config.get("dashscopeApiKey", "not-used"),
++                    }
++                    
++                    # Initialize system
++                    get_process_manager().set_global_config(normalized_config)
++                    get_imagebind_manager().initialize(normalized_config["image_bind_model_path"])
++                    get_imagebind_manager().ensure_imagebind_loaded()
++                    log_to_file(f"✅ Auto-initialized VideoRAG from bootstrap config: {store_dir}")
++                    return True
++    except Exception as e:
++        log_to_file(f"⚠️ Auto-initialization from bootstrap failed: {str(e)}")
++    
++    return False
++
+ def create_app():
+     """Create Flask application instance"""
+     app = Flask(__name__)
+@@ -839,6 +964,9 @@ def create_app():
+     # Register all routes
+     register_routes(app)
+     
++    # Auto-initialize from bootstrap config
++    auto_initialize_from_bootstrap()
++    
+     return app
+ 
+ def register_routes(app):
+@@ -939,8 +1067,16 @@ def register_routes(app):
+                     }), 400
+             
+             # Encode video
+-            log_to_file(f"🎬 Encoding {video_batch} video segments")
+-            result = get_imagebind_manager().encode_video_segments(video_batch).numpy()
++            log_to_file(f"🎬 Encoding {len(video_batch)} video segments")
++            result = get_imagebind_manager().encode_video_segments(video_batch)
++            
++            # Convert to numpy if it's a tensor
++            import torch
++            if isinstance(result, torch.Tensor):
++                result = result.cpu().numpy()
++            elif hasattr(result, 'numpy'):
++                result = result.numpy()
++            
+             # Convert numpy array to base64 string for transmission
+             result_bytes = pickle.dumps(result)
+             result_b64 = base64.b64encode(result_bytes).decode('utf-8')
+@@ -974,7 +1110,14 @@ def register_routes(app):
+                 }), 400
+             
+             # Encode query
+-            result = get_imagebind_manager().encode_string_query(query).numpy()
++            result = get_imagebind_manager().encode_string_query(query)
++            
++            # Convert to numpy if it's a tensor
++            import torch
++            if isinstance(result, torch.Tensor):
++                result = result.cpu().numpy()
++            elif hasattr(result, 'numpy'):
++                result = result.numpy()
+             
+             # Convert numpy array to base64 string for transmission
+             result_bytes = pickle.dumps(result)
